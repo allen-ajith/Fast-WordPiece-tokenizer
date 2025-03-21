@@ -1,0 +1,15 @@
+{
+  "unk_token": "[UNK]",
+  "sep_token": "[SEP]",
+  "pad_token": "[PAD]",
+  "cls_token": "[CLS]",
+  "mask_token": "[MASK]",
+  "max_input_chars_per_word": 100,
+  "remove_emojis": true,
+  "remove_accents": true,
+  "lowercase": true,
+  "strip_chars": null,
+  "do_basic_tokenize": true,
+  "never_split": [],
+  "cache_size": 100000
+}
