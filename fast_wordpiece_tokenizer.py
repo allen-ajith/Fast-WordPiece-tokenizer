@@ -627,20 +627,201 @@ def train_wordpiece_vocab(
     print(f"Final vocabulary size: {len(vocab):,}")
     return vocab
 
+def batch_tokenize_dict(self, texts: Union[str, List[str]], add_special_tokens: bool = True, 
+                        return_offsets: bool = True, padding: bool = False, 
+                        truncation: bool = False, max_length: int = None,
+                        batch_size: int = 1000, use_parallel: bool = True) -> Union[Dict, List[Dict]]:
+    """
+    Tokenize one or more texts and return dictionaries with tokenization details.
+    
+    Args:
+        texts: A single text string or list of texts to tokenize
+        add_special_tokens: Whether to add special tokens like [CLS] and [SEP]
+        return_offsets: Whether to include character offsets in the result
+        padding: Whether to pad the tokens to max_length
+        truncation: Whether to truncate the tokens to max_length
+        max_length: Maximum length for padding or truncation
+        batch_size: Size of batches for processing
+        use_parallel: Whether to use parallel processing
+        
+    Returns:
+        Dictionary for a single text or list of dictionaries for multiple texts
+    """
+    # Handle single text case
+    single_text = isinstance(texts, str)
+    if single_text:
+        texts = [texts]
+    
+    total_texts = len(texts)
+    results = []
+    
+    update_interval = max(1, total_texts // 100)
+    show_progress = total_texts > 10
+    
+    if show_progress:
+        pbar = tqdm(total=total_texts, desc="Tokenizing texts")
+    processed = 0
+    
+    def _process_text(text):
+        # Preprocess text
+        preprocessed_text = self._preprocess_text(text)
+        
+        # Tokenize into words first
+        if self.do_basic_tokenize:
+            words = self._basic_tokenize(preprocessed_text)
+        else:
+            words = [preprocessed_text]
+        
+        # Track offsets if requested
+        offsets = []
+        tokens = []
+        char_index = 0
+        
+        # Process each word
+        for word in words:
+            if not word:
+                continue
+            
+            # Handle words in never_split specially
+            if word in self.never_split:
+                word_start = preprocessed_text.find(word, char_index)
+                if word_start >= 0:
+                    tokens.append(word)
+                    if return_offsets:
+                        offsets.append((word_start, word_start + len(word)))
+                    char_index = word_start + len(word)
+                continue
+            
+            # Find offset of this word in the text
+            word_start = preprocessed_text.find(word, char_index)
+            if word_start >= 0:
+                char_index = word_start
+                
+            # Get subwords for this word
+            subwords = self._fast_wordpiece_tokenize(word)
+            
+            # Handle the offsets for subwords
+            if return_offsets:
+                if len(subwords) == 1:
+                    # For single token (whole word or UNK)
+                    offsets.append((word_start, word_start + len(word)))
+                elif subwords[0] == self.unk_token:
+                    # For UNK tokens
+                    offsets.append((word_start, word_start + len(word)))
+                else:
+                    # For multiple subwords
+                    current_char_index = word_start
+                    for subword in subwords:
+                        if subword.startswith("##"):
+                            actual_subword = subword[2:]
+                        else:
+                            actual_subword = subword
+                            
+                        subword_len = len(actual_subword)
+                        offsets.append((current_char_index, current_char_index + subword_len))
+                        current_char_index += subword_len
+            
+            tokens.extend(subwords)
+            
+            # Update char_index
+            if word_start >= 0:
+                char_index = word_start + len(word)
+        
+        # Generate special tokens mask
+        special_tokens_mask = [1 if token in self.special_tokens else 0 for token in tokens]
+        
+        # Add special tokens if requested
+        if add_special_tokens:
+            if return_offsets:
+                # Set dummy offsets for special tokens
+                offsets = [(0, 0)] + offsets + [(len(preprocessed_text), len(preprocessed_text))]
+            
+            tokens = [self.cls_token] + tokens + [self.sep_token]
+            special_tokens_mask = [1] + special_tokens_mask + [1]
+        
+        # Convert tokens to IDs
+        input_ids = self.convert_tokens_to_ids(tokens)
+        
+        # Apply truncation if requested
+        if truncation and max_length and len(input_ids) > max_length:
+            input_ids = input_ids[:max_length]
+            if return_offsets:
+                offsets = offsets[:max_length]
+            special_tokens_mask = special_tokens_mask[:max_length]
+            tokens = tokens[:max_length]
+        
+        # Create token type IDs (all 0 for single sequence)
+        token_type_ids = [0] * len(input_ids)
+        
+        # Create attention mask (all 1 for non-padding tokens)
+        attention_mask = [1] * len(input_ids)
+        
+        # Apply padding if requested
+        if padding and max_length:
+            padding_length = max_length - len(input_ids)
+            if padding_length > 0:
+                input_ids = input_ids + [self.vocab.get(self.pad_token)] * padding_length
+                token_type_ids = token_type_ids + [0] * padding_length
+                attention_mask = attention_mask + [0] * padding_length
+                special_tokens_mask = special_tokens_mask + [1] * padding_length
+                tokens = tokens + [self.pad_token] * padding_length
+                if return_offsets:
+                    # Use dummy offsets for padding tokens
+                    offsets = offsets + [(0, 0)] * padding_length
+        
+        # Build the result dictionary
+        result = {
+            "input_ids": input_ids,
+            "token_type_ids": token_type_ids,
+            "attention_mask": attention_mask,
+            "tokens": tokens,
+            "special_tokens_mask": special_tokens_mask
+        }
+        
+        if return_offsets:
+            result["offsets"] = offsets
+        
+        return result
+    
+    def _process_batch(batch_texts):
+        return [_process_text(text) for text in batch_texts]
+    
+    if use_parallel and self.num_cores > 1 and len(texts) > 1000:
+        with multiprocessing.Pool(processes=self.num_cores) as pool:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                
+                sub_batch_size = max(1, len(batch) // self.num_cores)
+                sub_batches = [batch[j:j + sub_batch_size] 
+                              for j in range(0, len(batch), sub_batch_size)]
+                
+                batch_results = pool.map(_process_batch, sub_batches)
+                
+                for sub_result in batch_results:
+                    results.extend(sub_result)
+                
+                processed += len(batch)
+                if show_progress and (processed // update_interval > (processed - len(batch)) // update_interval or processed == total_texts):
+                    pbar.update(processed - pbar.n)
+    else:
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch_results = _process_batch(batch)
+            results.extend(batch_results)
+            
+            processed += len(batch)
+            if show_progress and (processed // update_interval > (processed - len(batch)) // update_interval or processed == total_texts):
+                pbar.update(processed - pbar.n)
+    
+    if show_progress:
+        pbar.close()
+    
+    # Return a single dictionary for a single input
+    if single_text:
+        return results[0]
+    
+    return results
+
 
 if __name__ == "__main__":
-    # Example usage
-    # corpus_files = ["file1.txt", "file2.txt", "file3.txt"]
-    # vocab = train_wordpiece_vocab(files=corpus_files, vocab_size=30000)
-    
-    # tokenizer = FastWordPieceTokenizer(vocab=vocab)
-    # tokenizer.save_pretrained("bert_tokenizer")
-    
-    # loaded_tokenizer = FastWordPieceTokenizer.from_pretrained("bert_tokenizer")
-    
-    # Batch encoding example
-    # texts = ["Hello world", "This is another test", "WordPiece is fast"]
-    # encoded = loaded_tokenizer.batch_encode(texts)
-    # decoded = loaded_tokenizer.batch_decode(encoded)
-    
-    print("FastWordPieceTokenizer implementation complete.")
+    print("FastWordPieceTokenizer")
